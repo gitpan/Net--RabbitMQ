@@ -225,6 +225,32 @@ int internal_recv(HV *RETVAL, amqp_connection_state_t conn, int piggyback) {
   return result;
 }
 
+void hash_to_amqp_table(amqp_connection_state_t conn, HV *hash, amqp_table_t *table) {
+  HE   *he;
+  char *key;
+  SV   *value;
+  I32  retlen;
+
+  amqp_create_table(conn, table, HvKEYS(hash));
+
+  hv_iterinit(hash);
+  while (NULL != (he = hv_iternext(hash))) {
+    key = hv_iterkey(he, &retlen);
+    value = hv_iterval(hash, he);
+
+    if (SvGMAGICAL(value))
+      mg_get(value);
+
+    if (SvPOK(value)) {
+      amqp_table_add_string(conn, table, amqp_cstring_bytes(key), amqp_cstring_bytes(SvPV_nolen(value)));
+    } else if (SvIOK(value)) {
+      amqp_table_add_int(conn, table, amqp_cstring_bytes(key), (uint64_t) SvIV(value));
+    } else {
+      Perl_croak( aTHX_ "Unsupported SvType for hash value: %d", SvTYPE(value) );
+    }
+  }
+}
+
 MODULE = Net::RabbitMQ PACKAGE = Net::RabbitMQ PREFIX = net_rabbitmq_
 
 REQUIRE:        1.9505
@@ -364,6 +390,8 @@ net_rabbitmq_queue_declare(conn, channel, queuename, options = NULL, args = NULL
       int_from_hv(options, exclusive);
       int_from_hv(options, auto_delete);
     }
+    if(args)
+      hash_to_amqp_table(conn, args, &arguments);
     amqp_queue_declare_ok_t *r = amqp_queue_declare(conn, channel, queuename_b, passive,
                                                     durable, exclusive, auto_delete,
                                                     arguments);
@@ -387,8 +415,12 @@ net_rabbitmq_queue_bind(conn, channel, queuename, exchange, bindingkey, args = N
     amqp_rpc_reply_t *amqp_rpc_reply;
     amqp_table_t arguments = AMQP_EMPTY_TABLE;
   CODE:
-    if(queuename == NULL || exchange == NULL || bindingkey == NULL)
-      Perl_croak(aTHX_ "queuename, exchange and bindingkey must all be specified");
+    if(queuename == NULL || exchange == NULL)
+      Perl_croak(aTHX_ "queuename and exchange must both be specified");
+    if(bindingkey == NULL && args == NULL)
+      Perl_croak(aTHX_ "bindingkey or args must be specified");
+    if(args)
+      hash_to_amqp_table(conn, args, &arguments);
     amqp_queue_bind(conn, channel, amqp_cstring_bytes(queuename),
                     amqp_cstring_bytes(exchange),
                     amqp_cstring_bytes(bindingkey),
@@ -408,8 +440,12 @@ net_rabbitmq_queue_unbind(conn, channel, queuename, exchange, bindingkey, args =
     amqp_rpc_reply_t *amqp_rpc_reply;
     amqp_table_t arguments = AMQP_EMPTY_TABLE;
   CODE:
-    if(queuename == NULL || exchange == NULL || bindingkey == NULL)
-      Perl_croak(aTHX_ "queuename, exchange and bindingkey must all be specified");
+    if(queuename == NULL || exchange == NULL)
+      Perl_croak(aTHX_ "queuename and exchange must both be specified");
+    if(bindingkey == NULL && args == NULL)
+      Perl_croak(aTHX_ "bindingkey or args must be specified");
+    if(args)
+      hash_to_amqp_table(conn, args, &arguments);
     amqp_queue_unbind(conn, channel, amqp_cstring_bytes(queuename),
                       amqp_cstring_bytes(exchange),
                     amqp_cstring_bytes(bindingkey),
@@ -475,6 +511,25 @@ net_rabbitmq_ack(conn, channel, delivery_tag, multiple = 0)
     memcpy(&tag, l, sizeof(tag));
     die_on_error(aTHX_ amqp_basic_ack(conn, channel, tag, multiple),
                  "ack");
+
+
+void
+net_rabbitmq_reject(conn, channel, delivery_tag, requeue = 0)
+ Net::RabbitMQ conn
+ int channel
+ SV *delivery_tag
+ int requeue
+ PREINIT:
+   STRLEN len;
+   uint64_t tag;
+   unsigned char *l;
+ CODE:
+   l = SvPV(delivery_tag, len);
+   if(len != sizeof(tag)) Perl_croak(aTHX_ "bad tag");
+   memcpy(&tag, l, sizeof(tag));
+   die_on_error(aTHX_ amqp_basic_reject(conn, channel, tag, requeue),
+                "reject");
+
 
 void
 net_rabbitmq_purge(conn, channel, queuename, no_wait = 0)
@@ -569,31 +624,7 @@ net_rabbitmq__publish(conn, channel, routing_key, body, options = NULL, props = 
         properties._flags |= AMQP_BASIC_TIMESTAMP_FLAG;
       }
       if (NULL != (v = hv_fetch(props, "headers", strlen("headers"), 0))) {
-        HV *headers;
-        HE *he;
-        I32 iter;
-        char *key;
-        I32 retlen;
-        SV  *value;
-
-        headers = (HV *)SvRV(*v);
-        amqp_create_table(conn, &properties.headers, HvKEYS(headers));
-        hv_iterinit(headers);
-        while (NULL != (he = hv_iternext(headers))) {
-            key = hv_iterkey(he, &retlen);
-            value = hv_iterval(headers, he);
-
-            if (SvGMAGICAL(value))
-                mg_get(value);
-
-            if (SvPOK(value)) {
-                amqp_table_add_string(conn, &properties.headers, amqp_cstring_bytes(key), amqp_cstring_bytes(SvPV_nolen(value)));
-            } else if (SvIOK(value)) {
-                amqp_table_add_int(conn, &properties.headers, amqp_cstring_bytes(key), (uint64_t) SvIV(value));
-            } else {
-                Perl_croak( aTHX_ "Unsupported SvType for header value: %d", SvTYPE(value) );
-            }
-        }
+        hash_to_amqp_table(conn, (HV *)SvRV(*v), &properties.headers);
         properties._flags |= AMQP_BASIC_HEADERS_FLAG;
       }
     }
